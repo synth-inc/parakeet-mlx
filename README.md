@@ -180,7 +180,13 @@ from parakeet_mlx import from_pretrained, DecodingConfig, Beam
 model = from_pretrained("mlx-community/parakeet-tdt-0.6b-v3")
 
 config = DecodingConfig(
-    decoding = Beam(beam_size=5, n_best=3)
+    decoding = Beam(
+        beam_size=5,
+        n_best=3,
+        temperature=1.5,          # Explore less probable tokens
+        diversity_penalty=0.5,    # Penalize similar beams during search
+        diversity_threshold=0.3   # Filter similar hypotheses in final N-best
+    )
 )
 
 result = model.transcribe("audio_file.wav", decoding_config=config)
@@ -189,6 +195,11 @@ result = model.transcribe("audio_file.wav", decoding_config=config)
 for hyp in result.hypotheses:
     print(f"Text: {hyp.text}, Score: {hyp.score:.2f}, Confidence: {hyp.confidence:.2f}")
 ```
+
+Diversity parameters:
+- `temperature` (default: 1.0): Values > 1.0 flatten the token probability distribution, allowing less probable tokens to be explored
+- `diversity_penalty` (default: 0.5): Penalizes similar hypotheses during beam selection, encouraging diverse paths
+- `diversity_threshold` (default: 0.3): Filters final N-best hypotheses using word-level Jaccard distance (0.0 disables filtering)
 
 Use local attention:
 

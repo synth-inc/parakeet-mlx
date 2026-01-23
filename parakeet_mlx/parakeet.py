@@ -86,6 +86,50 @@ class Beam:
     length_penalty: float = 1.0
     patience: float = 1.0
     duration_reward: float = 0.7  # TDT-only
+    diversity_threshold: float = 0.3  # Minimum word-level difference ratio for N-best
+    diversity_penalty: float = 0.5  # Penalty applied during beam selection for similar hypotheses
+    temperature: float = 1.0  # Temperature for token sampling (>1 = more diverse, <1 = more focused)
+
+
+def _word_diversity_score(text1: str, text2: str) -> float:
+    """
+    Calculate word-level diversity between two texts.
+    Returns a value between 0 (identical) and 1 (completely different).
+    Uses Jaccard distance on word sets for efficiency.
+    """
+    words1 = set(text1.lower().split())
+    words2 = set(text2.lower().split())
+
+    if not words1 and not words2:
+        return 0.0
+    if not words1 or not words2:
+        return 1.0
+
+    intersection = len(words1 & words2)
+    union = len(words1 | words2)
+
+    # Jaccard distance = 1 - Jaccard similarity
+    return 1.0 - (intersection / union)
+
+
+def _token_similarity(tokens1: list, tokens2: list) -> float:
+    """
+    Calculate token-level similarity between two hypothesis token lists.
+    Returns a value between 0 (completely different) and 1 (identical).
+    Uses Jaccard similarity on token ID sets for efficiency.
+    """
+    if not tokens1 and not tokens2:
+        return 1.0
+    if not tokens1 or not tokens2:
+        return 0.0
+
+    ids1 = set(t.id for t in tokens1)
+    ids2 = set(t.id for t in tokens2)
+
+    intersection = len(ids1 & ids2)
+    union = len(ids1 | ids2)
+
+    return intersection / union if union > 0 else 1.0
 
 
 @dataclass
@@ -404,9 +448,11 @@ class ParakeetTDT(BaseParakeet):
                         joint_out[0, 0, 0, : len(self.vocabulary) + 1],
                         joint_out[0, 0, 0, len(self.vocabulary) + 1 :],
                     )
+                    # Apply temperature to encourage diversity in token selection
+                    temperature = config.decoding.temperature
                     token_logprobs, duration_logprobs = (
-                        nn.log_softmax(token_logits, -1),
-                        nn.log_softmax(duration_logits, -1),
+                        nn.log_softmax(token_logits / temperature, -1),
+                        nn.log_softmax(duration_logits / temperature, -1),
                     )
 
                     # raw python ops might be faster from here
@@ -507,15 +553,46 @@ class ParakeetTDT(BaseParakeet):
                         if hypothesis.step >= length
                     ]
                 )
-                active_beam = sorted(
-                    [
-                        hypothesis
-                        for hypothesis in candidates.values()
-                        if hypothesis.step < length
-                    ],
-                    key=lambda x: x.score,
-                    reverse=True,
-                )[: config.decoding.beam_size]
+
+                # Diverse beam selection with penalty for similar hypotheses
+                active_candidates = [
+                    hypothesis
+                    for hypothesis in candidates.values()
+                    if hypothesis.step < length
+                ]
+
+                diversity_penalty = config.decoding.diversity_penalty
+                if diversity_penalty > 0 and len(active_candidates) > 1:
+                    # Greedy diverse selection: iteratively pick best effective score
+                    active_beam = []
+                    remaining = list(active_candidates)
+
+                    while remaining and len(active_beam) < config.decoding.beam_size:
+                        best_idx = 0
+                        best_effective_score = float("-inf")
+
+                        for idx, candidate in enumerate(remaining):
+                            # Calculate penalty based on max similarity to selected beams
+                            penalty = 0.0
+                            for selected in active_beam:
+                                similarity = _token_similarity(
+                                    candidate.hypothesis, selected.hypothesis
+                                )
+                                penalty = max(penalty, similarity * diversity_penalty)
+
+                            effective_score = candidate.score - penalty
+
+                            if effective_score > best_effective_score:
+                                best_effective_score = effective_score
+                                best_idx = idx
+
+                        active_beam.append(remaining.pop(best_idx))
+                else:
+                    active_beam = sorted(
+                        active_candidates,
+                        key=lambda x: x.score,
+                        reverse=True,
+                    )[: config.decoding.beam_size]
 
             finished_hypothesis = finished_hypothesis + active_beam
 
@@ -541,24 +618,38 @@ class ParakeetTDT(BaseParakeet):
                 results.append(best.hypothesis)
                 results_hidden.append(best.hidden_state)
 
-                # Build N-best hypotheses list
-                n_best_hyps = []
-                for hyp in sorted_hyps[:n_best]:
+                # Build N-best hypotheses list with diversity filtering
+                n_best_hyps: list[NBestHypothesis] = []
+                diversity_threshold = config.decoding.diversity_threshold
+
+                for hyp in sorted_hyps:
+                    if len(n_best_hyps) >= n_best:
+                        break
+
                     hyp_text = "".join(
                         token.text for token in hyp.hypothesis
                     ).strip()
-                    hyp_len = max(1, len(hyp.hypothesis))
-                    normalized_score = hyp.score / hyp_len
-                    confidence = math.exp(normalized_score)
-                    # Clamp confidence to [0, 1] range
-                    confidence = min(1.0, max(0.0, confidence))
-                    n_best_hyps.append(
-                        NBestHypothesis(
-                            text=hyp_text,
-                            score=hyp.score,
-                            confidence=confidence,
+
+                    # Check diversity against already selected hypotheses
+                    is_diverse = True
+                    for selected in n_best_hyps:
+                        if _word_diversity_score(hyp_text, selected.text) < diversity_threshold:
+                            is_diverse = False
+                            break
+
+                    if is_diverse:
+                        hyp_len = max(1, len(hyp.hypothesis))
+                        normalized_score = hyp.score / hyp_len
+                        confidence = math.exp(normalized_score)
+                        # Clamp confidence to [0, 1] range
+                        confidence = min(1.0, max(0.0, confidence))
+                        n_best_hyps.append(
+                            NBestHypothesis(
+                                text=hyp_text,
+                                score=hyp.score,
+                                confidence=confidence,
+                            )
                         )
-                    )
                 results_nbest.append(n_best_hyps)
 
         return results, results_nbest, results_hidden
