@@ -89,6 +89,8 @@ class Beam:
     diversity_threshold: float = 0.3  # Minimum word-level difference ratio for N-best
     diversity_penalty: float = 0.5  # Penalty applied during beam selection for similar hypotheses
     temperature: float = 1.0  # Temperature for token sampling (>1 = more diverse, <1 = more focused)
+    use_sampling: bool = False  # Use sampling instead of top-k for token selection
+    top_p: float = 0.9  # Nucleus sampling threshold (only used if use_sampling=True)
 
 
 def _word_diversity_score(text1: str, text2: str) -> float:
@@ -130,6 +132,74 @@ def _token_similarity(tokens1: list, tokens2: list) -> float:
     union = len(ids1 | ids2)
 
     return intersection / union if union > 0 else 1.0
+
+
+def _nucleus_sample(logprobs: List[float], top_p: float, k: int) -> List[int]:
+    """
+    Perform nucleus (top-p) sampling to select k diverse tokens.
+
+    Args:
+        logprobs: Log probabilities for each token
+        top_p: Cumulative probability threshold
+        k: Number of tokens to sample
+
+    Returns:
+        List of k sampled token indices
+    """
+    import random
+
+    # Convert to probabilities
+    probs = [math.exp(lp) for lp in logprobs]
+    total = sum(probs)
+    probs = [p / total for p in probs]
+
+    # Sort by probability descending
+    indexed_probs = sorted(enumerate(probs), key=lambda x: x[1], reverse=True)
+
+    # Find nucleus (top-p)
+    cumsum = 0.0
+    nucleus_indices = []
+    for idx, prob in indexed_probs:
+        nucleus_indices.append(idx)
+        cumsum += prob
+        if cumsum >= top_p:
+            break
+
+    # Sample k tokens from nucleus without replacement
+    if len(nucleus_indices) <= k:
+        return nucleus_indices
+
+    # Renormalize probabilities for nucleus
+    nucleus_probs = [probs[i] for i in nucleus_indices]
+    total_nucleus = sum(nucleus_probs)
+    nucleus_probs = [p / total_nucleus for p in nucleus_probs]
+
+    # Sample without replacement
+    sampled = []
+    available_indices = list(range(len(nucleus_indices)))
+    available_probs = nucleus_probs.copy()
+
+    for _ in range(k):
+        if not available_indices:
+            break
+        # Normalize remaining probs
+        total_avail = sum(available_probs)
+        if total_avail <= 0:
+            break
+        normalized = [p / total_avail for p in available_probs]
+
+        # Sample one
+        r = random.random()
+        cumsum = 0.0
+        for i, prob in enumerate(normalized):
+            cumsum += prob
+            if r <= cumsum:
+                sampled.append(nucleus_indices[available_indices[i]])
+                available_indices.pop(i)
+                available_probs.pop(i)
+                break
+
+    return sampled
 
 
 @dataclass
@@ -455,27 +525,39 @@ class ParakeetTDT(BaseParakeet):
                         nn.log_softmax(duration_logits / temperature, -1),
                     )
 
-                    # raw python ops might be faster from here
-                    token_k, duration_k = (
-                        typing.cast(
-                            List[int],
-                            mx.argpartition(token_logprobs, -beam_token)[
-                                -beam_token:
-                            ].tolist(),
-                        ),
-                        typing.cast(
-                            List[int],
-                            mx.argpartition(duration_logprobs, -beam_duration)[
-                                -beam_duration:
-                            ].tolist(),
-                        ),
-                    )
-
                     # for faster accessing
-                    token_logprobs = typing.cast(List[float], token_logprobs.tolist())
-                    duration_logprobs = typing.cast(
+                    token_logprobs_list = typing.cast(List[float], token_logprobs.tolist())
+                    duration_logprobs_list = typing.cast(
                         List[float], duration_logprobs.tolist()
                     )
+
+                    # Select tokens either by top-k or sampling
+                    use_sampling = config.decoding.use_sampling
+                    if use_sampling:
+                        # Use nucleus sampling for diverse token selection
+                        top_p = config.decoding.top_p
+                        token_k = _nucleus_sample(token_logprobs_list, top_p, beam_token)
+                        duration_k = _nucleus_sample(duration_logprobs_list, top_p, beam_duration)
+                    else:
+                        # Standard top-k selection
+                        token_k, duration_k = (
+                            typing.cast(
+                                List[int],
+                                mx.argpartition(token_logprobs, -beam_token)[
+                                    -beam_token:
+                                ].tolist(),
+                            ),
+                            typing.cast(
+                                List[int],
+                                mx.argpartition(duration_logprobs, -beam_duration)[
+                                    -beam_duration:
+                                ].tolist(),
+                            ),
+                        )
+
+                    # Use the list version for accessing
+                    token_logprobs = token_logprobs_list
+                    duration_logprobs = duration_logprobs_list
 
                     for token in token_k:
                         is_blank = token == len(self.vocabulary)
