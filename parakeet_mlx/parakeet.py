@@ -81,16 +81,11 @@ class Greedy:
 
 @dataclass
 class Beam:
+    """Standard beam search decoding. Use MultipleSampling for diverse N-best hypotheses."""
     beam_size: int = 5
-    n_best: int = 1  # Number of hypotheses to return
     length_penalty: float = 1.0
     patience: float = 1.0
     duration_reward: float = 0.7  # TDT-only
-    diversity_threshold: float = 0.3  # Minimum word-level difference ratio for N-best
-    diversity_penalty: float = 0.5  # Penalty applied during beam selection for similar hypotheses
-    temperature: float = 1.0  # Temperature for token sampling (>1 = more diverse, <1 = more focused)
-    use_sampling: bool = False  # Use sampling instead of top-k for token selection
-    top_p: float = 0.9  # Nucleus sampling threshold (only used if use_sampling=True)
 
 
 @dataclass
@@ -100,115 +95,6 @@ class MultipleSampling:
     temperature: float = 1.5  # Temperature for sampling (>1 = more diverse)
     top_p: float = 0.95  # Nucleus sampling threshold
     duration_reward: float = 0.7  # TDT-only: reward for duration prediction
-
-
-def _word_diversity_score(text1: str, text2: str) -> float:
-    """
-    Calculate word-level diversity between two texts.
-    Returns a value between 0 (identical) and 1 (completely different).
-    Uses Jaccard distance on word sets for efficiency.
-    """
-    words1 = set(text1.lower().split())
-    words2 = set(text2.lower().split())
-
-    if not words1 and not words2:
-        return 0.0
-    if not words1 or not words2:
-        return 1.0
-
-    intersection = len(words1 & words2)
-    union = len(words1 | words2)
-
-    # Jaccard distance = 1 - Jaccard similarity
-    return 1.0 - (intersection / union)
-
-
-def _token_similarity(tokens1: list, tokens2: list) -> float:
-    """
-    Calculate token-level similarity between two hypothesis token lists.
-    Returns a value between 0 (completely different) and 1 (identical).
-    Uses Jaccard similarity on token ID sets for efficiency.
-    """
-    if not tokens1 and not tokens2:
-        return 1.0
-    if not tokens1 or not tokens2:
-        return 0.0
-
-    ids1 = set(t.id for t in tokens1)
-    ids2 = set(t.id for t in tokens2)
-
-    intersection = len(ids1 & ids2)
-    union = len(ids1 | ids2)
-
-    return intersection / union if union > 0 else 1.0
-
-
-def _nucleus_sample(logprobs: List[float], top_p: float, k: int) -> List[int]:
-    """
-    Perform nucleus (top-p) sampling to select k diverse tokens.
-
-    Args:
-        logprobs: Log probabilities for each token
-        top_p: Cumulative probability threshold
-        k: Number of tokens to sample
-
-    Returns:
-        List of k sampled token indices
-    """
-    import random
-
-    # Convert to probabilities
-    probs = [math.exp(lp) for lp in logprobs]
-    total = sum(probs)
-    probs = [p / total for p in probs]
-
-    # Sort by probability descending
-    indexed_probs = sorted(enumerate(probs), key=lambda x: x[1], reverse=True)
-
-    # Find nucleus (top-p)
-    cumsum = 0.0
-    nucleus_indices = []
-    for idx, prob in indexed_probs:
-        nucleus_indices.append(idx)
-        cumsum += prob
-        if cumsum >= top_p:
-            break
-
-    # Sample k tokens from nucleus without replacement
-    if len(nucleus_indices) <= k:
-        return nucleus_indices
-
-    # Renormalize probabilities for nucleus
-    nucleus_probs = [probs[i] for i in nucleus_indices]
-    total_nucleus = sum(nucleus_probs)
-    nucleus_probs = [p / total_nucleus for p in nucleus_probs]
-
-    # Sample without replacement
-    sampled = []
-    available_indices = list(range(len(nucleus_indices)))
-    available_probs = nucleus_probs.copy()
-
-    for _ in range(k):
-        if not available_indices:
-            break
-        # Normalize remaining probs
-        total_avail = sum(available_probs)
-        if total_avail <= 0:
-            break
-        normalized = [p / total_avail for p in available_probs]
-
-        # Sample one
-        r = random.random()
-        cumsum = 0.0
-        for i, prob in enumerate(normalized):
-            cumsum += prob
-            if r <= cumsum:
-                sampled.append(nucleus_indices[available_indices[i]])
-                available_indices.pop(i)
-                available_probs.pop(i)
-                break
-
-    return sampled
 
 
 @dataclass
@@ -457,7 +343,8 @@ class ParakeetTDT(BaseParakeet):
         list[list[NBestHypothesis]],
         list[Optional[tuple[mx.array, mx.array]]],
     ]:
-        assert isinstance(config.decoding, Beam)  # type guarntee
+        """Standard beam search decoding. Returns best hypothesis only."""
+        assert isinstance(config.decoding, Beam)
 
         beam_token = min(config.decoding.beam_size, len(self.vocabulary) + 1)
         beam_duration = min(config.decoding.beam_size, len(self.durations))
@@ -486,11 +373,10 @@ class ParakeetTDT(BaseParakeet):
         if last_token is None:
             last_token = list([None] * B)
 
-        n_best = config.decoding.n_best
-
         results = []
         results_nbest = []
         results_hidden = []
+
         for batch in range(B):
             feature = features[batch : batch + 1]
             length = int(lengths[batch])
@@ -531,46 +417,22 @@ class ParakeetTDT(BaseParakeet):
                         joint_out[0, 0, 0, : len(self.vocabulary) + 1],
                         joint_out[0, 0, 0, len(self.vocabulary) + 1 :],
                     )
-                    # Apply temperature to encourage diversity in token selection
-                    temperature = config.decoding.temperature
-                    token_logprobs, duration_logprobs = (
-                        nn.log_softmax(token_logits / temperature, -1),
-                        nn.log_softmax(duration_logits / temperature, -1),
+
+                    token_logprobs = nn.log_softmax(token_logits, -1)
+                    duration_logprobs = nn.log_softmax(duration_logits, -1)
+
+                    # Standard top-k selection
+                    token_k = typing.cast(
+                        List[int],
+                        mx.argpartition(token_logprobs, -beam_token)[-beam_token:].tolist(),
+                    )
+                    duration_k = typing.cast(
+                        List[int],
+                        mx.argpartition(duration_logprobs, -beam_duration)[-beam_duration:].tolist(),
                     )
 
-                    # for faster accessing
                     token_logprobs_list = typing.cast(List[float], token_logprobs.tolist())
-                    duration_logprobs_list = typing.cast(
-                        List[float], duration_logprobs.tolist()
-                    )
-
-                    # Select tokens either by top-k or sampling
-                    use_sampling = config.decoding.use_sampling
-                    if use_sampling:
-                        # Use nucleus sampling for diverse token selection
-                        top_p = config.decoding.top_p
-                        token_k = _nucleus_sample(token_logprobs_list, top_p, beam_token)
-                        duration_k = _nucleus_sample(duration_logprobs_list, top_p, beam_duration)
-                    else:
-                        # Standard top-k selection
-                        token_k, duration_k = (
-                            typing.cast(
-                                List[int],
-                                mx.argpartition(token_logprobs, -beam_token)[
-                                    -beam_token:
-                                ].tolist(),
-                            ),
-                            typing.cast(
-                                List[int],
-                                mx.argpartition(duration_logprobs, -beam_duration)[
-                                    -beam_duration:
-                                ].tolist(),
-                            ),
-                        )
-
-                    # Use the list version for accessing
-                    token_logprobs = token_logprobs_list
-                    duration_logprobs = duration_logprobs_list
+                    duration_logprobs_list = typing.cast(List[float], duration_logprobs.tolist())
 
                     for token in token_k:
                         is_blank = token == len(self.vocabulary)
@@ -578,26 +440,19 @@ class ParakeetTDT(BaseParakeet):
                             duration = self.durations[decision]
                             stuck = 0 if duration != 0 else hypothesis.stuck + 1
 
-                            if (
-                                self.max_symbols is not None
-                                and stuck >= self.max_symbols
-                            ):
+                            if self.max_symbols is not None and stuck >= self.max_symbols:
                                 step = hypothesis.step + 1
                                 stuck = 0
                             else:
                                 step = hypothesis.step + duration
 
-                            new_hypotheis = Hypothesis(
+                            new_hypothesis = Hypothesis(
                                 score=hypothesis.score
-                                + token_logprobs[token]
-                                * (1 - config.decoding.duration_reward)
-                                + duration_logprobs[decision]
-                                * (config.decoding.duration_reward),
+                                + token_logprobs_list[token] * (1 - config.decoding.duration_reward)
+                                + duration_logprobs_list[decision] * config.decoding.duration_reward,
                                 step=step,
                                 last_token=hypothesis.last_token if is_blank else token,
-                                hidden_state=hypothesis.hidden_state
-                                if is_blank
-                                else decoder_hidden,
+                                hidden_state=hypothesis.hidden_state if is_blank else decoder_hidden,
                                 stuck=stuck,
                                 hypothesis=hypothesis.hypothesis
                                 if is_blank
@@ -606,88 +461,40 @@ class ParakeetTDT(BaseParakeet):
                                     + [
                                         AlignedToken(
                                             id=token,
-                                            start=hypothesis.step
-                                            * self.time_ratio,  # hop
-                                            duration=duration * self.time_ratio,  # hop
+                                            start=hypothesis.step * self.time_ratio,
+                                            duration=duration * self.time_ratio,
                                             confidence=math.exp(
-                                                token_logprobs[token]
-                                                + duration_logprobs[decision]
+                                                token_logprobs_list[token] + duration_logprobs_list[decision]
                                             ),
-                                            text=tokenizer.decode(
-                                                [token], self.vocabulary
-                                            ),
+                                            text=tokenizer.decode([token], self.vocabulary),
                                         )
                                     ]
                                 ),
                             )
 
-                            # merge if anyone took same path
-                            key = hash(new_hypotheis)
+                            # Merge if same path
+                            key = hash(new_hypothesis)
                             if key in candidates:
-                                other_hypothesis = candidates[key]
-
-                                # log sum exp
-                                maxima = max(
-                                    other_hypothesis.score, new_hypotheis.score
-                                )
+                                other = candidates[key]
+                                maxima = max(other.score, new_hypothesis.score)
                                 score = maxima + math.log(
-                                    math.exp(other_hypothesis.score - maxima)
-                                    + math.exp(new_hypotheis.score - maxima)
+                                    math.exp(other.score - maxima) + math.exp(new_hypothesis.score - maxima)
                                 )
-
-                                if new_hypotheis.score > other_hypothesis.score:
-                                    candidates[key] = new_hypotheis
+                                if new_hypothesis.score > other.score:
+                                    candidates[key] = new_hypothesis
                                 candidates[key].score = score
                             else:
-                                candidates[key] = new_hypotheis
+                                candidates[key] = new_hypothesis
 
                 finished_hypothesis.extend(
-                    [
-                        hypothesis
-                        for hypothesis in candidates.values()
-                        if hypothesis.step >= length
-                    ]
+                    [h for h in candidates.values() if h.step >= length]
                 )
 
-                # Diverse beam selection with penalty for similar hypotheses
-                active_candidates = [
-                    hypothesis
-                    for hypothesis in candidates.values()
-                    if hypothesis.step < length
-                ]
-
-                diversity_penalty = config.decoding.diversity_penalty
-                if diversity_penalty > 0 and len(active_candidates) > 1:
-                    # Greedy diverse selection: iteratively pick best effective score
-                    active_beam = []
-                    remaining = list(active_candidates)
-
-                    while remaining and len(active_beam) < config.decoding.beam_size:
-                        best_idx = 0
-                        best_effective_score = float("-inf")
-
-                        for idx, candidate in enumerate(remaining):
-                            # Calculate penalty based on max similarity to selected beams
-                            penalty = 0.0
-                            for selected in active_beam:
-                                similarity = _token_similarity(
-                                    candidate.hypothesis, selected.hypothesis
-                                )
-                                penalty = max(penalty, similarity * diversity_penalty)
-
-                            effective_score = candidate.score - penalty
-
-                            if effective_score > best_effective_score:
-                                best_effective_score = effective_score
-                                best_idx = idx
-
-                        active_beam.append(remaining.pop(best_idx))
-                else:
-                    active_beam = sorted(
-                        active_candidates,
-                        key=lambda x: x.score,
-                        reverse=True,
-                    )[: config.decoding.beam_size]
+                active_beam = sorted(
+                    [h for h in candidates.values() if h.step < length],
+                    key=lambda x: x.score,
+                    reverse=True,
+                )[: config.decoding.beam_size]
 
             finished_hypothesis = finished_hypothesis + active_beam
 
@@ -696,56 +503,27 @@ class ParakeetTDT(BaseParakeet):
                 results_nbest.append([])
                 results_hidden.append(hidden_state[batch])
             else:
-                length_penalty = (
-                    config.decoding.length_penalty
-                )  # mypy assumes weirdly so we go in safe way
+                length_penalty = config.decoding.length_penalty
 
-                # Sort hypotheses by normalized score
                 sorted_hyps = sorted(
                     finished_hypothesis,
-                    key=lambda x: x.score
-                    / (max(1, len(x.hypothesis)) ** length_penalty),
+                    key=lambda x: x.score / (max(1, len(x.hypothesis)) ** length_penalty),
                     reverse=True,
                 )
 
-                # Get the best hypothesis for backward compatibility
                 best = sorted_hyps[0]
                 results.append(best.hypothesis)
                 results_hidden.append(best.hidden_state)
 
-                # Build N-best hypotheses list with diversity filtering
-                n_best_hyps: list[NBestHypothesis] = []
-                diversity_threshold = config.decoding.diversity_threshold
+                # Return single best as n-best list
+                hyp_text = "".join(token.text for token in best.hypothesis).strip()
+                hyp_len = max(1, len(best.hypothesis))
+                normalized_score = best.score / hyp_len
+                confidence = min(1.0, max(0.0, math.exp(normalized_score)))
 
-                for hyp in sorted_hyps:
-                    if len(n_best_hyps) >= n_best:
-                        break
-
-                    hyp_text = "".join(
-                        token.text for token in hyp.hypothesis
-                    ).strip()
-
-                    # Check diversity against already selected hypotheses
-                    is_diverse = True
-                    for selected in n_best_hyps:
-                        if _word_diversity_score(hyp_text, selected.text) < diversity_threshold:
-                            is_diverse = False
-                            break
-
-                    if is_diverse:
-                        hyp_len = max(1, len(hyp.hypothesis))
-                        normalized_score = hyp.score / hyp_len
-                        confidence = math.exp(normalized_score)
-                        # Clamp confidence to [0, 1] range
-                        confidence = min(1.0, max(0.0, confidence))
-                        n_best_hyps.append(
-                            NBestHypothesis(
-                                text=hyp_text,
-                                score=hyp.score,
-                                confidence=confidence,
-                            )
-                        )
-                results_nbest.append(n_best_hyps)
+                results_nbest.append([
+                    NBestHypothesis(text=hyp_text, score=best.score, confidence=confidence)
+                ])
 
         return results, results_nbest, results_hidden
 
