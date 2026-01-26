@@ -93,6 +93,15 @@ class Beam:
     top_p: float = 0.9  # Nucleus sampling threshold (only used if use_sampling=True)
 
 
+@dataclass
+class MultipleSampling:
+    """Run N independent greedy decodings with sampling for diverse hypotheses."""
+    n_samples: int = 3  # Number of independent samples to generate
+    temperature: float = 1.5  # Temperature for sampling (>1 = more diverse)
+    top_p: float = 0.95  # Nucleus sampling threshold
+    duration_reward: float = 0.7  # TDT-only: reward for duration prediction
+
+
 def _word_diversity_score(text1: str, text2: str) -> float:
     """
     Calculate word-level diversity between two texts.
@@ -204,7 +213,7 @@ def _nucleus_sample(logprobs: List[float], top_p: float, k: int) -> List[int]:
 
 @dataclass
 class DecodingConfig:
-    decoding: Union[Greedy, Beam] = field(default_factory=Greedy)
+    decoding: Union[Greedy, Beam, MultipleSampling] = field(default_factory=Greedy)
     sentence: SentenceConfig = field(default_factory=SentenceConfig)
 
 
@@ -424,6 +433,10 @@ class ParakeetTDT(BaseParakeet):
                 return tokens, None, hidden
             case Beam():
                 return self.decode_beam(
+                    features, lengths, last_token, hidden_state, config=config
+                )
+            case MultipleSampling():
+                return self.decode_sampling(
                     features, lengths, last_token, hidden_state, config=config
                 )
             case _:
@@ -735,6 +748,212 @@ class ParakeetTDT(BaseParakeet):
                 results_nbest.append(n_best_hyps)
 
         return results, results_nbest, results_hidden
+
+    def decode_sampling(
+        self,
+        features: mx.array,
+        lengths: Optional[mx.array] = None,
+        last_token: Optional[list[Optional[int]]] = None,
+        hidden_state: Optional[list[Optional[tuple[mx.array, mx.array]]]] = None,
+        *,
+        config: DecodingConfig = DecodingConfig(),
+    ) -> tuple[
+        list[list[AlignedToken]],
+        list[list[NBestHypothesis]],
+        list[Optional[tuple[mx.array, mx.array]]],
+    ]:
+        """
+        Run N independent greedy decodings with sampling for diverse hypotheses.
+        Each decoding run uses temperature-scaled softmax and nucleus sampling,
+        producing genuinely different transcriptions.
+        """
+        import random
+
+        assert isinstance(config.decoding, MultipleSampling)
+
+        n_samples = config.decoding.n_samples
+        temperature = config.decoding.temperature
+        top_p = config.decoding.top_p
+        duration_reward = config.decoding.duration_reward
+
+        B, S, *_ = features.shape
+
+        if hidden_state is None:
+            hidden_state = list([None] * B)
+
+        if lengths is None:
+            lengths = mx.array([S] * B)
+
+        if last_token is None:
+            last_token = list([None] * B)
+
+        results = []
+        results_nbest = []
+        results_hidden = []
+
+        for batch in range(B):
+            feature = features[batch : batch + 1]
+            length = int(lengths[batch])
+
+            all_hypotheses: list[tuple[list[AlignedToken], float, Optional[tuple[mx.array, mx.array]]]] = []
+
+            # Run N independent sampling passes
+            for sample_idx in range(n_samples):
+                hypothesis = []
+                score = 0.0
+
+                step = 0
+                new_symbols = 0
+                current_last_token = last_token[batch]
+                current_hidden = hidden_state[batch]
+
+                while step < length:
+                    # decoder pass
+                    decoder_out, (hidden, cell) = self.decoder(
+                        mx.array([[current_last_token]])
+                        if current_last_token is not None
+                        else None,
+                        current_hidden,
+                    )
+                    decoder_out = decoder_out.astype(feature.dtype)
+                    decoder_hidden = (
+                        hidden.astype(feature.dtype),
+                        cell.astype(feature.dtype),
+                    )
+
+                    # joint pass
+                    joint_out = self.joint(feature[:, step : step + 1], decoder_out)
+
+                    token_logits, duration_logits = (
+                        joint_out[0, 0, 0, : len(self.vocabulary) + 1],
+                        joint_out[0, 0, 0, len(self.vocabulary) + 1 :],
+                    )
+
+                    # Apply temperature
+                    token_logprobs = nn.log_softmax(token_logits / temperature, -1)
+                    duration_logprobs = nn.log_softmax(duration_logits / temperature, -1)
+
+                    token_logprobs_list = typing.cast(List[float], token_logprobs.tolist())
+                    duration_logprobs_list = typing.cast(List[float], duration_logprobs.tolist())
+
+                    # Sample token using nucleus sampling
+                    pred_token = self._sample_nucleus(token_logprobs_list, top_p)
+
+                    # Sample duration using nucleus sampling
+                    decision = self._sample_nucleus(duration_logprobs_list, top_p)
+
+                    # Accumulate score
+                    score += (
+                        token_logprobs_list[pred_token] * (1 - duration_reward)
+                        + duration_logprobs_list[decision] * duration_reward
+                    )
+
+                    # TDT decoding rule
+                    is_blank = pred_token == len(self.vocabulary)
+                    duration = self.durations[decision]
+
+                    if not is_blank:
+                        # Compute confidence
+                        token_probs = mx.softmax(token_logits, axis=-1)
+                        vocab_size = len(self.vocabulary) + 1
+                        entropy = -mx.sum(token_probs * mx.log(token_probs + 1e-10), axis=-1)
+                        max_entropy = mx.log(mx.array(vocab_size, dtype=token_probs.dtype))
+                        confidence = float(1.0 - (entropy / max_entropy))
+
+                        hypothesis.append(
+                            AlignedToken(
+                                int(pred_token),
+                                start=step * self.time_ratio,
+                                duration=duration * self.time_ratio,
+                                confidence=confidence,
+                                text=tokenizer.decode([pred_token], self.vocabulary),
+                            )
+                        )
+                        current_last_token = pred_token
+                        current_hidden = decoder_hidden
+
+                    step += duration
+
+                    # Prevent stucking rule
+                    if duration == 0:
+                        new_symbols += 1
+                        if self.max_symbols is not None and new_symbols >= self.max_symbols:
+                            step += 1
+                            new_symbols = 0
+                    else:
+                        new_symbols = 0
+
+                all_hypotheses.append((hypothesis, score, current_hidden))
+
+            # Sort by score and pick best
+            all_hypotheses.sort(key=lambda x: x[1], reverse=True)
+
+            best_hypothesis, best_score, best_hidden = all_hypotheses[0]
+            results.append(best_hypothesis)
+            results_hidden.append(best_hidden)
+
+            # Build N-best list
+            n_best_hyps: list[NBestHypothesis] = []
+            for hyp, hyp_score, _ in all_hypotheses:
+                hyp_text = "".join(token.text for token in hyp).strip()
+                hyp_len = max(1, len(hyp))
+                normalized_score = hyp_score / hyp_len
+                confidence = math.exp(normalized_score)
+                confidence = min(1.0, max(0.0, confidence))
+
+                n_best_hyps.append(
+                    NBestHypothesis(
+                        text=hyp_text,
+                        score=hyp_score,
+                        confidence=confidence,
+                    )
+                )
+
+            results_nbest.append(n_best_hyps)
+
+        return results, results_nbest, results_hidden
+
+    def _sample_nucleus(self, logprobs: List[float], top_p: float) -> int:
+        """
+        Sample a single token using nucleus (top-p) sampling.
+
+        Args:
+            logprobs: Log probabilities for each token
+            top_p: Cumulative probability threshold
+
+        Returns:
+            Sampled token index
+        """
+        import random
+
+        # Convert to probabilities
+        probs = [math.exp(lp) for lp in logprobs]
+        total = sum(probs)
+        probs = [p / total for p in probs]
+
+        # Sort by probability descending
+        indexed_probs = sorted(enumerate(probs), key=lambda x: x[1], reverse=True)
+
+        # Find nucleus (top-p)
+        cumsum = 0.0
+        nucleus = []
+        for idx, prob in indexed_probs:
+            nucleus.append((idx, prob))
+            cumsum += prob
+            if cumsum >= top_p:
+                break
+
+        # Renormalize and sample
+        total_nucleus = sum(p for _, p in nucleus)
+        r = random.random() * total_nucleus
+        cumsum = 0.0
+        for idx, prob in nucleus:
+            cumsum += prob
+            if r <= cumsum:
+                return idx
+
+        # Fallback to most probable
+        return nucleus[0][0]
 
     def decode_greedy(
         self,
